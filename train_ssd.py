@@ -2,6 +2,7 @@ from data import *
 from utils.augmentations import SSDAugmentation
 from layers.modules import MultiBoxLoss
 from ssd import build_ssd
+from retinanet import build_retinanet
 import os
 import sys
 import time
@@ -14,6 +15,8 @@ import torch.nn.init as init
 import torch.utils.data as data
 import numpy as np
 import argparse
+import torchvision
+from eval_utils import test_net
 
 
 def str2bool(v):
@@ -23,20 +26,32 @@ def str2bool(v):
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Training With Pytorch')
 train_set = parser.add_mutually_exclusive_group()
+parser.add_argument('--arch',
+                    type=str)
+parser.add_argument('--use_focal',
+                    type=str2bool)
 parser.add_argument('--dataset', default='VOC300', choices=['VOC300', 'VOC512'],
                     type=str, help='VOC300 or VOC512')
 parser.add_argument('--dataset_root', default=VOC_ROOT,
                     help='Dataset root directory path')
 parser.add_argument('--basenet', default='vgg16_reducedfc.pth',
                     help='Pretrained base model')
+parser.add_argument('--size', default=30000, type=int,
+                    help='img size')
 parser.add_argument('--batch_size', default=32, type=int,
                     help='Batch size for training')
 parser.add_argument('--resume', default=None, type=str,
                     help='Checkpoint state_dict file to resume training from')
 parser.add_argument('--start_iter', default=0, type=int,
                     help='Resume training at this iter')
-parser.add_argument('--num_workers', default=1, type=int,
+parser.add_argument('--num_workers', default=16, type=int,
                     help='Number of workers used in dataloading')
+parser.add_argument('--log_period', default=20, type=int,
+                    help='log pediod')
+parser.add_argument('--eval_period', default=5000, type=int,
+                    help='eval period')
+parser.add_argument('--checkpoint_period', default=5000, type=int,
+                    help='checkpoint period')
 parser.add_argument('--cuda', default=True, type=str2bool,
                     help='Use CUDA to train model')
 parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
@@ -51,7 +66,24 @@ parser.add_argument('--visdom', default=False, type=str2bool,
                     help='Use visdom for loss visualization')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
+parser.add_argument('--save_folder_eval', default='eval/', type=str,
+                    help='File path to save results')
+parser.add_argument('--top_k', default=200, type=int,
+                    help='Further restrict the number of predictions to parse')
+parser.add_argument('--confidence_threshold', default=0.01, type=float,
+                    help='Detection confidence threshold')
 args = parser.parse_args()
+
+
+# EVAL UTILS
+annopath = os.path.join(args.dataset_root, 'VOC2007', 'Annotations', '%s.xml')
+imgpath = os.path.join(args.dataset_root, 'VOC2007', 'JPEGImages', '%s.jpg')
+imgsetpath = os.path.join(args.dataset_root, 'VOC2007', 'ImageSets',
+                          'Main', '{:s}.txt')
+YEAR = '2007'
+devkit_path = args.dataset_root + 'VOC' + YEAR
+dataset_mean = (104, 117, 123)
+set_type = 'test'
 
 
 if torch.cuda.is_available():
@@ -87,6 +119,15 @@ def train():
         dataset = VOCDetection(root=args.dataset_root,
                                transform=SSDAugmentation(cfg['min_dim'],
                                                          MEANS))
+
+        val_dataset = VOCDetection(args.dataset_root, [('2007', "test")],
+                                BaseTransform(cfg["min_dim"], dataset_mean),
+                                VOCAnnotationTransform(), test=True)
+        val_data_loader = data.DataLoader(val_dataset, args.batch_size,
+                                    num_workers=args.num_workers,
+                                    shuffle=False, collate_fn=detection_collate_eval,
+                                    pin_memory=True)
+
     elif args.dataset == 'VOC512':
         if args.dataset_root == COCO_ROOT:
             parser.error('Must specify dataset if specifying dataset_root')
@@ -99,7 +140,12 @@ def train():
         import visdom
         viz = visdom.Visdom()
 
-    ssd_net = build_ssd('train', cfg['min_dim'], cfg['num_classes'])
+    if args.arch == "ssd":
+        ssd_net = build_ssd('train', cfg['min_dim'], cfg['num_classes'], top_k=args.top_k, thresh=args.confidence_threshold)
+    elif args.arch == "retinanet":
+        ssd_net = build_retinanet('train', cfg['min_dim'], cfg['num_classes'], top_k=args.top_k, thresh=args.confidence_threshold)
+    else:
+        raise Exception("unknown arch")
     net = ssd_net
 
     if args.cuda:
@@ -110,24 +156,30 @@ def train():
         print('Resuming training, loading {}...'.format(args.resume))
         ssd_net.load_weights(args.resume)
     else:
-        vgg_weights = torch.load(args.save_folder + args.basenet)
-        print('Loading base network...')
-        ssd_net.vgg.load_state_dict(vgg_weights)
+        if args.arch == "ssd":
+            vgg_weights = torch.load(args.save_folder + args.basenet)
+            print('Loading base network...')
+            ssd_net.vgg.load_state_dict(vgg_weights)
 
     if args.cuda:
         net = net.cuda()
 
     if not args.resume:
-        print('Initializing weights...')
-        # initialize newly added layers' weights with xavier method
-        ssd_net.extras.apply(weights_init)
-        ssd_net.loc.apply(weights_init)
-        ssd_net.conf.apply(weights_init)
+        if args.arch == "ssd":
+            print('Initializing weights...')
+            # initialize newly added layers' weights with xavier method
+            ssd_net.extras.apply(weights_init)
+            ssd_net.loc.apply(weights_init)
+            ssd_net.conf.apply(weights_init)
+        elif args.arch == "retinanet":
+            r50w = torchvision.models.resnet50(pretrained=True)
+            net.module.fpn.load_state_dict(r50w.state_dict(), strict=False)
+
 
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                           weight_decay=args.weight_decay)
     criterion = MultiBoxLoss(cfg['num_classes'], 0.5, True, 0, True, 3, 0.5,
-                             False, args.cuda)
+                            False, args.cuda, use_focal=args.use_focal)
 
     net.train()
     # loss counters
@@ -153,9 +205,33 @@ def train():
                                   num_workers=args.num_workers,
                                   shuffle=True, collate_fn=detection_collate,
                                   pin_memory=True)
+    mean_aps = []
     # create batch iterator
     batch_iterator = iter(data_loader)
     for iteration in range(args.start_iter, cfg['max_iter']):
+
+        if (iteration % args.eval_period == 0) and iteration >= 2000:
+            print("EVAL")
+            net.eval()
+            net.module.phase = "test"
+            mean_ap = test_net(annopath, imgsetpath, set_type, devkit_path, args.save_folder_eval, net, args.cuda, val_data_loader,
+                            BaseTransform(cfg["min_dim"], dataset_mean), args.top_k, cfg["min_dim"],
+                            thresh=args.confidence_threshold)
+            mean_aps.append(mean_ap)
+            net.train()
+            net.module.phase = "train"
+
+            if len(mean_aps) >= 4:
+                print("check ap", mean_ap, mean_aps[-2], mean_aps[-3], mean_aps[-4])
+                if mean_ap <= mean_aps[-2] and mean_ap <= mean_aps[-3] and mean_ap <= mean_aps[-4]:
+                    print("dropping LR: ", mean_aps[-2], mean_aps[-3], mean_aps[-4])
+                    mean_aps = []
+                    step_index += 1
+                    if step_index > 3:
+                        print("FIN")
+                        break
+                    adjust_learning_rate(optimizer, args.gamma, step_index)
+
         if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
             update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
                             'append', epoch_size)
@@ -164,9 +240,9 @@ def train():
             conf_loss = 0
             epoch += 1
 
-        if iteration in cfg['lr_steps']:
-            step_index += 1
-            adjust_learning_rate(optimizer, args.gamma, step_index)
+        # if iteration in cfg['lr_steps']:
+        #     step_index += 1
+        #     adjust_learning_rate(optimizer, args.gamma, step_index)
 
         # load train data
         # images, targets = next(batch_iterator)
@@ -195,7 +271,7 @@ def train():
         loc_loss += loss_l.data#[0]
         conf_loss += loss_c.data#[0]
 
-        if iteration % 10 == 0:
+        if iteration % args.log_period == 0:
             print('timer: %.4f sec.' % (t1 - t0))
             print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.data), end=' ')
         # print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.data[0]), end=' ')
@@ -204,7 +280,7 @@ def train():
         #     update_vis_plot(iteration, loss_l.data[0], loss_c.data[0],
         #                     iter_plot, epoch_plot, 'append')
 
-        if iteration != 0 and (iteration+1) % 10000 == 0:
+        if iteration != 0 and (iteration+1) % args.checkpoint_period == 0:
             print('Saving state, iter:', iteration)
             torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
                        repr(iteration) + '.pth')

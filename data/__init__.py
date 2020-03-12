@@ -36,6 +36,30 @@ def detection_collate(batch):
         return torch.stack(imgs, 0), targets, semis
     # return torch.stack(imgs, 0), targets
 
+def detection_collate_eval(batch):
+    """Custom collate fn for dealing with batches of images that have a different
+    number of associated object annotations (bounding boxes).
+
+    Arguments:
+        batch: (tuple) A tuple of tensor images and lists of annotations
+
+    Return:
+        A tuple containing:
+            1) (tensor) batch of images stacked on their 0 dim
+            2) (list of tensors) annotations for a given image are stacked on
+                                 0 dim
+    """
+    ### changed when semi-supervised
+    im = []
+    gt = []
+    h, w = [], []
+    for sample in batch:
+        im.append(sample[0])
+        gt.append(sample[1])
+        h.append(sample[2])
+        w.append(sample[3])
+    return torch.stack(im, 0), gt, h, w
+
 
 def base_transform(image, size, mean):
     x = cv2.resize(image, (size, size)).astype(np.float32)

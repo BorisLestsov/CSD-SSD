@@ -7,6 +7,55 @@ from data import coco as cfg
 from ..box_utils import match, log_sum_exp
 
 
+def one_hot_embedding(labels, num_classes):
+    '''Embedding labels to one-hot form.
+    Args:
+      labels: (LongTensor) class labels, sized [N,].
+      num_classes: (int) number of classes.
+    Returns:
+      (tensor) encoded labels, sized [N,#classes].
+    '''
+    y = torch.eye(num_classes)  # [D,D]
+    return y[labels]            # [N,D]
+
+
+def focal_loss(x, y, size_average, reduce, args=None):
+    '''Focal loss.
+    Args:
+      x: (tensor) sized [N,D].
+      y: (tensor) sized [N,].
+    Return:
+      (tensor) focal loss.
+    '''
+    if args is None:
+        alpha = 0.25
+        gamma = 2
+    else:
+        alpha = args.focal_alpha
+        gamma = args.focal_gamma
+
+    num_classes = x.shape[1]
+
+
+    t = one_hot_embedding(y.data.cpu(), num_classes)
+    #t = t[:,1:]  # exclude background
+    t.cuda()
+
+    sm = torch.nn.Softmax(dim=1)
+    p = sm(x)
+
+    pt = p*t + (1-p)*(1-t)         # pt = p if t > 0 else 1-p
+    w = alpha*t + (1-alpha)*(1-t)  # w = alpha if t > 0 else 1-alpha
+    w = w * (1-pt).pow(gamma)
+
+    w = torch.gather(w, 1, y.view(-1, 1)).view(-1)
+    ce = F.cross_entropy(x, y, size_average=size_average, reduce=False)
+    res = w*ce
+    if reduce:
+        res = res.sum()
+    return res
+
+
 class MultiBoxLoss(nn.Module):
     """SSD Weighted Loss Function
     Compute Targets:
@@ -32,7 +81,7 @@ class MultiBoxLoss(nn.Module):
 
     def __init__(self, num_classes, overlap_thresh, prior_for_matching,
                  bkg_label, neg_mining, neg_pos, neg_overlap, encode_target,
-                 use_gpu=True):
+                 use_gpu=True, use_focal=False):
         super(MultiBoxLoss, self).__init__()
         self.use_gpu = use_gpu
         self.num_classes = num_classes
@@ -44,6 +93,7 @@ class MultiBoxLoss(nn.Module):
         self.negpos_ratio = neg_pos
         self.neg_overlap = neg_overlap
         self.variance = cfg['variance']
+        self.use_focal = use_focal
 
     def forward(self, predictions, targets):
         """Multibox Loss
@@ -108,7 +158,10 @@ class MultiBoxLoss(nn.Module):
         neg_idx = neg.unsqueeze(2).expand_as(conf_data)
         conf_p = conf_data[(pos_idx+neg_idx).gt(0)].view(-1, self.num_classes)
         targets_weighted = conf_t[(pos+neg).gt(0)]
-        loss_c = F.cross_entropy(conf_p, targets_weighted, size_average=False)
+        if not self.use_focal:
+            loss_c = F.cross_entropy(conf_p, targets_weighted, size_average=False)
+        else:
+            loss_c = focal_loss(conf_p, targets_weighted, size_average=False, reduce=True)
 
         # Sum of losses: L(x,c,l,g) = (Lconf(x, c) + αLloc(x,l,g)) / N
 

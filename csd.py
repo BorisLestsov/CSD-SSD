@@ -29,7 +29,7 @@ class SSD_CON(nn.Module):
         head: "multibox head" consists of loc and conf conv layers
     """
 
-    def __init__(self, phase, size, base, extras, head, num_classes):
+    def __init__(self, phase, size, base, extras, head, num_classes, top_k=200, thresh=0.01):
         super(SSD_CON, self).__init__()
         self.phase = phase
         self.num_classes = num_classes
@@ -52,9 +52,8 @@ class SSD_CON(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
 
-        if phase == 'test':
-            # self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+        # if phase == 'test':
+        self.detect = Detect(num_classes, 0, top_k, thresh, 0.45)
 
     def forward(self, x):
         """Applies network layers and ops on input image(s) x.
@@ -113,6 +112,8 @@ class SSD_CON(nn.Module):
         # zero_mask = torch.cat([o.view(o.size(0), -1) for o in zero_mask], 1)
 
         if self.phase == "test":
+            if self.priors.device != loc.device:
+                self.priors = self.priors.to(loc.device)
             output = self.detect(
                 loc.view(loc.size(0), -1, 4),                   # loc preds
                 self.softmax(conf.view(conf.size(0), -1,
@@ -286,7 +287,7 @@ class GaussianNoise(nn.Module):
             return x + self.noise[:x.size(0)]
 
 
-def build_ssd_con(phase, size=300, num_classes=21):
+def build_ssd_con(phase, size=300, num_classes=21, top_k=200, thresh=0.01):
     if phase != "test" and phase != "train":
         print("ERROR: Phase: " + phase + " not recognized")
         return
@@ -297,5 +298,5 @@ def build_ssd_con(phase, size=300, num_classes=21):
     base_, extras_, head_ = multibox(vgg(base[str(size)], 3),
                                      add_extras(extras[str(size)], 1024),
                                      mbox[str(size)], num_classes)
-    return SSD_CON(phase, size, base_, extras_, head_, num_classes)
+    return SSD_CON(phase, size, base_, extras_, head_, num_classes, top_k=top_k, thresh=thresh)
 

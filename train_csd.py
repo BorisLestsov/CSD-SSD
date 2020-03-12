@@ -20,6 +20,7 @@ import argparse
 import math
 import copy
 
+from eval_utils import test_net
 
 def str2bool(v):
     return v.lower() in ("yes", "true", "t", "1")
@@ -28,6 +29,10 @@ def str2bool(v):
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Training With Pytorch')
 train_set = parser.add_mutually_exclusive_group()
+parser.add_argument('--arch',
+                    type=str)
+parser.add_argument('--use_focal',
+                    type=str2bool)
 parser.add_argument('--dataset', default='VOC300', choices=['VOC300', 'VOC512'],
                     type=str, help='VOC300 or VOC512')
 parser.add_argument('--dataset_root', default=VOC_ROOT,
@@ -56,7 +61,31 @@ parser.add_argument('--visdom', default=False, type=str2bool,
                     help='Use visdom for loss visualization')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
+parser.add_argument('--size', default=30000, type=int,
+                    help='img size')
+parser.add_argument('--log_period', default=20, type=int,
+                    help='log pediod')
+parser.add_argument('--eval_period', default=5000, type=int,
+                    help='eval period')
+parser.add_argument('--checkpoint_period', default=5000, type=int,
+                    help='checkpoint period')
+parser.add_argument('--save_folder_eval', default='eval/', type=str,
+                    help='File path to save results')
+parser.add_argument('--top_k', default=200, type=int,
+                    help='Further restrict the number of predictions to parse')
+parser.add_argument('--confidence_threshold', default=0.01, type=float,
+                    help='Detection confidence threshold')
 args = parser.parse_args()
+
+# EVAL UTILS
+annopath = os.path.join(args.dataset_root, 'VOC2007', 'Annotations', '%s.xml')
+imgpath = os.path.join(args.dataset_root, 'VOC2007', 'JPEGImages', '%s.jpg')
+imgsetpath = os.path.join(args.dataset_root, 'VOC2007', 'ImageSets',
+                          'Main', '{:s}.txt')
+YEAR = '2007'
+devkit_path = args.dataset_root + 'VOC' + YEAR
+dataset_mean = (104, 117, 123)
+set_type = 'test'
 
 
 if torch.cuda.is_available():
@@ -107,7 +136,7 @@ def train():
     finish_flag = True
 
     while(finish_flag):
-        ssd_net = build_ssd_con('train', cfg['min_dim'], cfg['num_classes'])
+        ssd_net = build_ssd_con('train', cfg['min_dim'], cfg['num_classes'], top_k=args.top_k, thresh=args.confidence_threshold)
         net = ssd_net
 
         if args.cuda:
@@ -164,6 +193,14 @@ def train():
         #unsupervised_batch = args.batch_size - supervised_batch
         #data_shuffle = 0
 
+
+        val_dataset = VOCDetection(args.dataset_root, [('2007', "test")],
+                                BaseTransform(cfg["min_dim"], dataset_mean),
+                                VOCAnnotationTransform(), test=True)
+        val_data_loader = data.DataLoader(val_dataset, args.batch_size,
+                                    num_workers=args.num_workers,
+                                    shuffle=False, collate_fn=detection_collate_eval,
+                                    pin_memory=True)
         if(args.start_iter==0):
             supervised_dataset = VOCDetection_con_init(root=args.dataset_root,
                                                      transform=SSDAugmentation(cfg['min_dim'],
@@ -183,7 +220,30 @@ def train():
 
         batch_iterator = iter(supervised_data_loader)
 
+        mean_aps = []
         for iteration in range(args.start_iter, cfg['max_iter']):
+            if (iteration % args.eval_period == 0) and iteration >= 2000:
+                print("EVAL")
+                net.eval()
+                net.module.phase = "test"
+                mean_ap = test_net(annopath, imgsetpath, set_type, devkit_path, args.save_folder_eval, net, args.cuda, val_data_loader,
+                                BaseTransform(cfg["min_dim"], dataset_mean), args.top_k, cfg["min_dim"],
+                                thresh=args.confidence_threshold)
+                mean_aps.append(mean_ap)
+                net.train()
+                net.module.phase = "train"
+                if len(mean_aps) >= 4:
+                    print("check ap")
+                    if mean_ap <= mean_aps[-2] and mean_ap <= mean_aps[-3] and mean_ap <= mean_aps[-4]:
+                        print("dropping LR: ", mean_aps[-2], mean_aps[-3], mean_aps[-4])
+                        mean_aps = []
+                        step_index += 1
+                        if step_index > 3:
+                            print("FIN")
+                            finish_flag = False
+                            break
+                        adjust_learning_rate(optimizer, args.gamma, step_index)
+
             if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
                 update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
                                 'append', epoch_size)
@@ -192,9 +252,9 @@ def train():
                 conf_loss = 0
                 epoch += 1
 
-            if iteration in cfg['lr_steps']:
-                step_index += 1
-                adjust_learning_rate(optimizer, args.gamma, step_index)
+            # if iteration in cfg['lr_steps']:
+            #     step_index += 1
+            #     adjust_learning_rate(optimizer, args.gamma, step_index)
 
             try:
                 images, targets, semis = next(batch_iterator)
@@ -336,7 +396,7 @@ def train():
                 conf_loss += loss_c.data  # [0]
 
 
-            if iteration % 10 == 0:
+            if iteration % args.log_period == 0:
                 print('timer: %.4f sec.' % (t1 - t0))
                 print('iter ' + repr(iteration) + ' || Loss: %.4f || consistency_loss : %.4f ||' % (loss.data, consistency_loss.data), end=' ')
                 print('loss: %.4f , loss_c: %.4f , loss_l: %.4f , loss_con: %.4f, lr : %.4f, super_len : %d\n' % (loss.data, loss_c.data, loss_l.data, consistency_loss.data,float(optimizer.param_groups[0]['lr']),len(sup_image_index)))
@@ -349,7 +409,7 @@ def train():
                 update_vis_plot(iteration, loss_l.data, loss_c.data,
                                 iter_plot, epoch_plot, 'append')
 
-            if iteration != 0 and (iteration+1) % 40000 == 0:
+            if iteration != 0 and (iteration+1) % args.checkpoint_period == 0:
                 print('Saving state, iter:', iteration)
                 torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
                            repr(iteration+1) + '.pth')

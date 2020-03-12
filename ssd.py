@@ -25,7 +25,7 @@ class SSD(nn.Module):
         head: "multibox head" consists of loc and conf conv layers
     """
 
-    def __init__(self, phase, size, base, extras, head, num_classes):
+    def __init__(self, phase, size, base, extras, head, num_classes, top_k=200, thresh=0.01):
         super(SSD, self).__init__()
         self.phase = phase
         self.num_classes = num_classes
@@ -46,9 +46,9 @@ class SSD(nn.Module):
         self.loc = nn.ModuleList(head[0])
         self.conf = nn.ModuleList(head[1])
 
-        if phase == 'test':
-            self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+        # if phase == 'test':
+        self.softmax = nn.Softmax(dim=-1)
+        self.detect = Detect(num_classes, 0, top_k, thresh, 0.45)
 
     def forward(self, x):
         """Applies network layers and ops on input image(s) x.
@@ -99,6 +99,8 @@ class SSD(nn.Module):
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
         if self.phase == "test":
+            if self.priors.device != loc.device:
+                self.priors = self.priors.to(loc.device)
             output = self.detect(
                 loc.view(loc.size(0), -1, 4),                   # loc preds
                 self.softmax(conf.view(conf.size(0), -1,
@@ -204,7 +206,7 @@ mbox = {
 
 
 
-def build_ssd(phase, size=300, num_classes=21):
+def build_ssd(phase, size=300, num_classes=21, top_k=200, thresh=0.01):
     if phase != "test" and phase != "train":
         print("ERROR: Phase: " + phase + " not recognized")
         return
@@ -215,4 +217,4 @@ def build_ssd(phase, size=300, num_classes=21):
     base_, extras_, head_ = multibox(vgg(base[str(size)], 3),
                                      add_extras(extras[str(size)], 1024),
                                      mbox[str(size)], num_classes)
-    return SSD(phase, size, base_, extras_, head_, num_classes)
+    return SSD(phase, size, base_, extras_, head_, num_classes, top_k=top_k, thresh=thresh)
