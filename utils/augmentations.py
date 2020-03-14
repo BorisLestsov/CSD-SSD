@@ -398,20 +398,44 @@ class PhotometricDistort(object):
 
 
 class SSDAugmentation(object):
-    def __init__(self, size=300, mean=(104, 117, 123)):
+    default_aug = [
+        "ConvertFromInts",
+        "ToAbsoluteCoords",
+        "PhotometricDistort",
+        "Expand",
+        "RandomSampleCrop",
+        "RandomMirror",
+        "ToPercentCoords",
+        "Resize",
+        "SubtractMeans",
+    ]
+    def __init__(self, size=300, mean=(104, 117, 123), aug_list=default_aug):
         self.mean = mean
         self.size = size
-        self.augment = Compose([
-            ConvertFromInts(),
-            ToAbsoluteCoords(),
-            PhotometricDistort(),
-            Expand(self.mean),
-            RandomSampleCrop(),
-            RandomMirror(),
-            ToPercentCoords(),
-            Resize(self.size),
-            SubtractMeans(self.mean)
-        ])
+        self.augment = []
+        for aug_n in aug_list:
+            if aug_n == "ConvertFromInts":
+                self.augment.append(ConvertFromInts())
+            elif aug_n == "ToAbsoluteCoords":
+                self.augment.append(ToAbsoluteCoords())
+            elif aug_n == "PhotometricDistort":
+                self.augment.append(PhotometricDistort())
+            elif aug_n == "Expand":
+                self.augment.append(Expand(self.mean))
+            elif aug_n == "RandomSampleCrop":
+                self.augment.append(RandomSampleCrop())
+            elif aug_n == "RandomMirror":
+                self.augment.append(RandomMirror())
+            elif aug_n == "ToPercentCoords":
+                self.augment.append(ToPercentCoords())
+            elif aug_n == "Resize":
+                self.augment.append(Resize(self.size))
+            elif aug_n == "SubtractMeans":
+                self.augment.append(SubtractMeans(self.mean))
+            else:
+                raise Exception("Unknown aug")
+
+        self.augment = Compose(self.augment)
 
     def __call__(self, img, boxes, labels):
         return self.augment(img, boxes, labels)

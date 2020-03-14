@@ -16,6 +16,9 @@ if sys.version_info[0] == 2:
     import xml.etree.cElementTree as ET
 else:
     import xml.etree.ElementTree as ET
+import imagesize
+sys.path.append("..")
+from utils.augmentations import SSDAugmentation
 
 VOC_CLASSES = (  # always index 0
     'aeroplane', 'bicycle', 'bird', 'boat',
@@ -110,16 +113,50 @@ class VOCDetection_con(data.Dataset):
         self._annopath = osp.join('%s', 'Annotations', '%s.xml')
         self._imgpath = osp.join('%s', 'JPEGImages', '%s.jpg')
         self.ids = list()
+        self.target_dict = {}
         for (year, name) in image_sets:
             if(name=='trainval'):
                 rootpath = osp.join(self.root, 'VOC' + year)
                 for line in open(osp.join(rootpath, 'ImageSets', 'Main', name + '.txt')):
                     self.ids.append((rootpath, line.strip()))
+                    img_id = self.ids[-1]
+                    if (img_id[0][(len(img_id[0]) - 7):] == 'VOC2007'):
+                        target = ET.parse(self._annopath % img_id).getroot()
+                        width, height = imagesize.get(self._imgpath % img_id)
+                        if self.target_transform is not None:
+                            target = self.target_transform(target, width, height)
+                    else:
+                        target = np.zeros([1, 5])
+                    self.target_dict[img_id] = target
             else:
                 rootpath = osp.join(self.coco_root)
                 for line in open(osp.join(rootpath, name + '.txt')):
                     self.ids.append((rootpath, line.strip()))
 
+                    img_id = self.ids[-1]
+                    if (img_id[0][(len(img_id[0]) - 7):] == 'VOC2007'):
+                        target = ET.parse(self._annopath % img_id).getroot()
+                        width, height = imagesize.get(self._imgpath % img_id)
+                        if self.target_transform is not None:
+                            target = self.target_transform(target, width, height)
+                    else:
+                        target = np.zeros([1, 5])
+                    self.target_dict[img_id] = target
+
+        weak_list = [
+            "ConvertFromInts",
+            "ToAbsoluteCoords",
+            "RandomMirror",
+            "ToPercentCoords",
+            "Resize",
+            "SubtractMeans",
+        ]
+        self.weak_transform = SSDAugmentation(self.transform.size, self.transform.mean, weak_list)
+        strong_list = [
+            "SubtractMeans",
+            "PhotometricDistort",
+        ]
+        self.strong_transform = SSDAugmentation(self.transform.size, (-104, -117, -123), strong_list)
 
     def __getitem__(self, index):
         # im, gt, h, w = self.pull_item(index)
@@ -134,40 +171,45 @@ class VOCDetection_con(data.Dataset):
     def pull_item(self, index):
         img_id = self.ids[index]
 
-        if (img_id[0][(len(img_id[0]) - 7):] == 'VOC2007'):
-            target = ET.parse(self._annopath % img_id).getroot()
-            img = cv2.imread(self._imgpath % img_id)
-            semi = np.array([1])
-        elif (img_id[0][(len(img_id[0]) - 7):] == 'VOC2012'):
-            img = cv2.imread(self._imgpath % img_id)
-            target = np.zeros([1, 5])
-            semi = np.array([0])
-        else:
-            img = cv2.imread('%s/%s' % img_id)
-            target = np.zeros([1, 5])
-            semi = np.array([0])
-
+        target = self.target_dict[img_id]
+        target = np.array(target)
+        img = cv2.imread(self._imgpath % img_id)
         height, width, channels = img.shape
 
         if (img_id[0][(len(img_id[0]) - 7):] == 'VOC2007'):
-            if self.target_transform is not None:
-                target = self.target_transform(target, width, height)
-
-        if self.transform is not None:
-            target = np.array(target)
-            img, boxes, labels = self.transform(img, target[:, :4], target[:, 4])
-            # to rgb
-            img = img[:, :, (2, 1, 0)]
-            # img = img.transpose(2, 0, 1)
-            target = np.hstack((boxes, np.expand_dims(labels, axis=1)))
-
-        if(img_id[0][(len(img_id[0])-7):]=='VOC2007'):
+            # target = ET.parse(self._annopath % img_id).getroot()
             semi = np.array([1])
-        else:
-            semi = np.array([0])
-            target = np.zeros([1,5])
+            if self.transform is not None:
+                img, boxes, labels = self.transform(img, target[:, :4], target[:, 4])
+                # to rgb
+                img = img[:, :, (2, 1, 0)]
+                # img = img.transpose(2, 0, 1)
+                target = np.hstack((boxes, np.expand_dims(labels, axis=1)))
+            # img = torch.from_numpy(img).permute(2, 0, 1)
+            img = np.concatenate([img[None, ...], img[None, ...]], axis=0)
+            img = torch.from_numpy(img).permute(0, 3, 1, 2)
 
-        return torch.from_numpy(img).permute(2, 0, 1), target, height, width, semi
+        elif (img_id[0][(len(img_id[0]) - 7):] == 'VOC2012'):
+            semi = np.array([0])
+            if self.weak_transform is not None:
+                img_w, boxes, labels = self.weak_transform(img, target[:, :4], target[:, 4])
+                # to rgb
+                img_w = img_w[:, :, (2, 1, 0)]
+                # img = img.transpose(2, 0, 1)
+                target = np.hstack((boxes, np.expand_dims(labels, axis=1)))
+            if self.strong_transform is not None:
+                img_s, boxes, labels = self.strong_transform(img_w.copy(), target[:, :4], target[:, 4])
+                # to rgb
+                img_s = img_s[:, :, (2, 1, 0)]
+                # img = img.transpose(2, 0, 1)
+                target = np.hstack((boxes, np.expand_dims(labels, axis=1)))
+            img = np.concatenate([img_w[None, ...], img_s[None, ...]], axis=0)
+            img = torch.from_numpy(img).permute(0, 3, 1, 2)
+        else:
+            raise Exception("unknown dataset?")
+            #semi = np.array([0])
+
+        return img, target, height, width, semi
 
         # return torch.from_numpy(img), target, height, width
 

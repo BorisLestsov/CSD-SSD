@@ -75,6 +75,8 @@ parser.add_argument('--top_k', default=200, type=int,
                     help='Further restrict the number of predictions to parse')
 parser.add_argument('--confidence_threshold', default=0.01, type=float,
                     help='Detection confidence threshold')
+parser.add_argument('--need_vis', default=False, type=str2bool,
+                    help='vis')
 args = parser.parse_args()
 
 # EVAL UTILS
@@ -102,6 +104,7 @@ if not os.path.exists(args.save_folder):
     os.mkdir(args.save_folder)
 
 
+viz = None
 def train():
     if args.dataset == 'COCO':
         if args.dataset_root == VOC_ROOT:
@@ -131,7 +134,9 @@ def train():
 
     if args.visdom:
         import visdom
+        global viz
         viz = visdom.Visdom()
+    epoch_size = len(dataset) // args.batch_size
 
     finish_flag = True
 
@@ -244,9 +249,9 @@ def train():
                             break
                         adjust_learning_rate(optimizer, args.gamma, step_index)
 
-            if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
-                update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
-                                'append', epoch_size)
+            if args.visdom and iteration != 0 and (iteration % args.epoch_size == 0):
+                # update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
+                #                 'append', args.epoch_size)
                 # reset epoch loss counters
                 loc_loss = 0
                 conf_loss = 0
@@ -271,6 +276,47 @@ def train():
                 images, targets, semis = next(batch_iterator)
 
 
+            # TRAINING
+            if not supervised_flag:
+                sup_image_binary_index = []
+                unsup_weak_image_binary_index = []
+                unsup_strong_image_binary_index = []
+                all_images = []
+                targets_dbg = []
+                for el_idx, is_sup in enumerate(semis):
+                    if(int(is_sup)==0):
+                        # unsup
+                        all_images.append(images[el_idx, 0, ...].unsqueeze(0))
+                        all_images.append(images[el_idx, 1, ...].unsqueeze(0))
+                        unsup_weak_image_binary_index += [1, 0]
+                        unsup_strong_image_binary_index += [0, 1]
+                        sup_image_binary_index += [0, 0]
+                        targets_dbg.append(targets[el_idx])
+                        targets_dbg.append(targets[el_idx])
+                    else:
+                        # sup
+                        all_images.append(images[el_idx, 0, ...].unsqueeze(0))
+                        all_images.append(images[el_idx, 0, ...].unsqueeze(0))
+                        unsup_weak_image_binary_index += [0, 0]
+                        unsup_strong_image_binary_index += [0, 0]
+                        sup_image_binary_index += [1, 0]
+                        targets_dbg.append(targets[el_idx])
+                        targets_dbg.append(targets[el_idx])
+
+                targets = [tgt for tgt_i, tgt in enumerate(targets) if semis[tgt_i] == 1.]
+
+                sup_image_binary_index = np.array(sup_image_binary_index)
+                unsup_weak_image_binary_index = np.array(unsup_weak_image_binary_index)
+                unsup_strong_image_binary_index = np.array(unsup_strong_image_binary_index)
+
+                images = torch.cat(all_images, dim=0)
+
+                # print([1 if sss == 1 else 0 for sss in semis])
+                # print(sup_image_binary_index)
+                # print(unsup_weak_image_binary_index)
+                # print(unsup_strong_image_binary_index)
+                # print(images.shape)
+
             if args.cuda:
                 images = Variable(images.cuda())
                 targets = [Variable(ann.cuda(), volatile=True) for ann in targets]
@@ -281,24 +327,98 @@ def train():
             t0 = time.time()
 
             out, conf, conf_flip, loc, loc_flip = net(images)
+            loc_data, conf_data, priors = out
 
 
-            sup_image_binary_index = np.zeros([len(semis),1])
+            # PS
+            if not supervised_flag:
+                loss_l_ps = Variable(torch.cuda.FloatTensor([0]))
+                loss_c_ps = Variable(torch.cuda.FloatTensor([0]))
 
-            for super_image in range(len(semis)):
-                if(int(semis[super_image])==1):
-                    sup_image_binary_index[super_image] = 1
-                else:
-                    sup_image_binary_index[super_image] = 0
+                net.eval()
+                net.module.phase = "ps"
+                with torch.no_grad():
+                    detections_batch = net(images.cuda()).data
+                net.train()
+                net.module.phase = "train"
 
-                if(int(semis[len(semis)-1-super_image])==0):
-                    del targets[len(semis)-1-super_image]
+                ps_thresh = 0.5
+                all_boxes = [[] for _ in range(images.shape[0])]
+                h, w = images.shape[2], images.shape[3]
+                all_cls_dets = []
+                for im_i in range(images.shape[0]):
+                    detections = detections_batch[im_i].unsqueeze(0)
+                    for j in range(1, detections.size(1)):
+                        dets = detections[0, j, :]
+                        mask = dets[:, 0].gt(ps_thresh).expand(5, dets.size(0)).t()
+                        dets = torch.masked_select(dets, mask).view(-1, 5)
+                        if dets.dim() == 0:
+                            cls_dets = np.zeros(0, 5)
+                        else:
+                            boxes = dets[:, 1:]
+                            scores = dets[:, 0].cpu().numpy()
+                            cls_dets = np.hstack((boxes.cpu().numpy(),
+                                                np.full((boxes.shape[0], 1), j))).astype(np.float32,
+                                                                                copy=False)
+                        all_boxes[im_i].append(cls_dets)
+                all_boxes = [np.vstack(boxes) for boxes in all_boxes]
+                targets_pred = [torch.from_numpy(boxes) for boxes in all_boxes]
+
+                targets_weak_ind    = unsup_weak_image_binary_index
+                targets_nz_ind = np.array([1 if targets_pred[img_ind].shape[0] !=0 else 0 for img_ind in range(images.shape[0])])
+
+                targets_weak_nz_ind = torch.from_numpy(targets_weak_ind & targets_nz_ind)
+                if targets_weak_nz_ind.bool().any():
+                    targets_weak = [torch.from_numpy(np.array(targets_pred[img_ind])) for img_ind in range(images.shape[0]) if targets_weak_nz_ind[img_ind] == 1]
+                    targets_ps = [Variable(ann.detach().cuda(), volatile=True) for ann in targets_weak]
+
+                    strong_index = np.where(targets_weak_nz_ind == 1)[0] + 1
+                    output_strong = (
+                        loc_data[strong_index, ...],
+                        conf_data[strong_index, ...],
+                        priors
+                    )
+                    # loss_l_ps, loss_c_ps = criterion(output_strong, targets_ps)
+
+
+                if args.need_vis:
+                    # sup
+                    img_set = images
+                    for dbg_i in range(img_set.shape[0]):
+                        dbg_img = img_set[dbg_i].cpu().numpy().transpose(1,2,0)
+                        dbg_img[:,:,0] += 104
+                        dbg_img[:,:,1] += 113
+                        dbg_img[:,:,2] += 123
+                        dbg_img = np.clip(dbg_img, 0, 255)
+                        dbg_img = dbg_img.astype(np.uint8).copy()
+
+                        if sup_image_binary_index[dbg_i]:
+                            dbg_tgt = targets_dbg[dbg_i].cpu().numpy().copy()
+                            dbg_tgt[:, 0] *= dbg_img.shape[1]
+                            dbg_tgt[:, 2] *= dbg_img.shape[0]
+                            dbg_tgt[:, 1] *= dbg_img.shape[1]
+                            dbg_tgt[:, 3] *= dbg_img.shape[0]
+                            dbg_tgt = dbg_tgt.astype(np.int32)
+                            for pt in dbg_tgt:
+                                cv2.rectangle(dbg_img, (pt[0], pt[1]), (pt[2], pt[3]), (255,0,0), 2)
+
+                        if unsup_weak_image_binary_index[dbg_i] or unsup_strong_image_binary_index[dbg_i]:
+                            dbg_pred = targets_pred[dbg_i].cpu().numpy().copy()
+                            if dbg_pred.size != 0:
+                                dbg_pred[:, 0] *= dbg_img.shape[1]
+                                dbg_pred[:, 2] *= dbg_img.shape[0]
+                                dbg_pred[:, 1] *= dbg_img.shape[1]
+                                dbg_pred[:, 3] *= dbg_img.shape[0]
+                                for pt in dbg_pred:
+                                    cv2.rectangle(dbg_img, (pt[0], pt[1]), (pt[2], pt[3]), (0,0,255), 2)
+
+                        print("saving...")
+                        cv2.imwrite("dbg/out_{}_{}.png".format(iteration, dbg_i), cv2.cvtColor(dbg_img, cv2.COLOR_BGR2RGB))
 
 
             sup_image_index = np.where(sup_image_binary_index == 1)[0]
             unsup_image_index = np.where(sup_image_binary_index == 0)[0]
 
-            loc_data, conf_data, priors = out
 
             if (len(sup_image_index) != 0):
                 loc_data = loc_data[sup_image_index,:,:]
@@ -380,6 +500,8 @@ def train():
                     loss = consistency_loss
                 else:
                     loss = loss_l + loss_c + consistency_loss
+                # PSEUDO LABEL
+                # loss += loss_l_ps + loss_c_ps
 
 
             if(loss.data>0):
@@ -399,13 +521,13 @@ def train():
             if iteration % args.log_period == 0:
                 print('timer: %.4f sec.' % (t1 - t0))
                 print('iter ' + repr(iteration) + ' || Loss: %.4f || consistency_loss : %.4f ||' % (loss.data, consistency_loss.data), end=' ')
-                print('loss: %.4f , loss_c: %.4f , loss_l: %.4f , loss_con: %.4f, lr : %.4f, super_len : %d\n' % (loss.data, loss_c.data, loss_l.data, consistency_loss.data,float(optimizer.param_groups[0]['lr']),len(sup_image_index)))
+                print('loss: %.4f , loss_c: %.4f , loss_l: %.4f , loss_con: %.4f, loss_c_ps: %.4f, loss_l_ps: %.4f, lr : %.4f, super_len : %d\n' % (loss.data, loss_c.data, loss_l.data, consistency_loss.data, loss_c_ps, loss_l_ps, float(optimizer.param_groups[0]['lr']),len(sup_image_index)))
 
 
             if(float(loss)>100):
                 break
 
-            if args.visdom:
+            if args.visdom and iteration != 0:
                 update_vis_plot(iteration, loss_l.data, loss_c.data,
                                 iter_plot, epoch_plot, 'append')
 
@@ -486,12 +608,13 @@ def update_vis_plot(iteration, loc, conf, window1, window2, update_type,
     )
     # initialize epoch plot on first iteration
     if iteration == 0:
-        viz.line(
-            X=torch.zeros((1, 3)).cpu(),
-            Y=torch.Tensor([loc, conf, loc + conf]).unsqueeze(0).cpu(),
-            win=window2,
-            update=True
-        )
+        if not window2 is None:
+            viz.line(
+                X=torch.zeros((1, 3)).cpu(),
+                Y=torch.Tensor([loc, conf, loc + conf]).unsqueeze(0).cpu(),
+                win=window2,
+                update=True
+            )
 
 
 if __name__ == '__main__':
