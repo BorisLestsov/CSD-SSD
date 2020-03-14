@@ -334,6 +334,7 @@ def train():
             if not supervised_flag:
                 loss_l_ps = Variable(torch.cuda.FloatTensor([0]))
                 loss_c_ps = Variable(torch.cuda.FloatTensor([0]))
+                train_pseudo = False
 
                 net.eval()
                 net.module.phase = "ps"
@@ -358,7 +359,7 @@ def train():
                             boxes = dets[:, 1:]
                             scores = dets[:, 0].cpu().numpy()
                             cls_dets = np.hstack((boxes.cpu().numpy(),
-                                                np.full((boxes.shape[0], 1), j))).astype(np.float32,
+                                                np.full((boxes.shape[0], 1), j-1))).astype(np.float32,
                                                                                 copy=False)
                         all_boxes[im_i].append(cls_dets)
                 all_boxes = [np.vstack(boxes) for boxes in all_boxes]
@@ -368,7 +369,8 @@ def train():
                 targets_nz_ind = np.array([1 if targets_pred[img_ind].shape[0] !=0 else 0 for img_ind in range(images.shape[0])])
 
                 targets_weak_nz_ind = torch.from_numpy(targets_weak_ind & targets_nz_ind)
-                if targets_weak_nz_ind.bool().any():
+                train_pseudo = targets_weak_nz_ind.bool().any()
+                if train_pseudo:
                     targets_weak = [torch.from_numpy(np.array(targets_pred[img_ind])) for img_ind in range(images.shape[0]) if targets_weak_nz_ind[img_ind] == 1]
                     targets_ps = [Variable(ann.detach().cuda(), volatile=True) for ann in targets_weak]
 
@@ -378,7 +380,7 @@ def train():
                         conf_data[strong_index, ...],
                         priors
                     )
-                    # loss_l_ps, loss_c_ps = criterion(output_strong, targets_ps)
+                    loss_l_ps, loss_c_ps = criterion(output_strong, targets_ps)
 
 
                 if args.need_vis:
@@ -501,7 +503,8 @@ def train():
                 else:
                     loss = loss_l + loss_c + consistency_loss
                 # PSEUDO LABEL
-                # loss += loss_l_ps + loss_c_ps
+                if train_pseudo:
+                    loss += loss_l_ps + loss_c_ps
 
 
             if(loss.data>0):
@@ -525,6 +528,7 @@ def train():
 
 
             if(float(loss)>100):
+                print("WTF BIG LOSS", float(loss))
                 break
 
             if args.visdom and iteration != 0:
